@@ -80,14 +80,79 @@ parse_args() {
 
 # Function to display available network interfaces
 show_interfaces() {
-    echo -e "${BLUE}Available wireless interfaces:${NC}"
-    ip link show | grep -E '^[0-9]+:' | grep -i wireless | cut -d: -f2 | sed 's/^ //'
+    local interfaces=()
+    local i=1
     
-    # If no wireless interfaces found, show all interfaces
-    if [ $? -ne 0 ]; then
-        echo -e "${YELLOW}No wireless interfaces found, showing all interfaces:${NC}"
-        ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | sed 's/^ //'
+    echo -e "${BLUE}Detecting network interfaces...${NC}"
+    
+    # Try multiple methods to identify wireless interfaces
+    
+    # Method 1: Check for interfaces in /sys/class/net with wireless subdirectory
+    for iface in /sys/class/net/*; do
+        if [ -d "$iface/wireless" ] || [ -d "$iface/phy80211" ]; then
+            interfaces+=("$(basename "$iface")")
+        fi
+    done
+    
+    # Method 2: Use iw command if available
+    if command -v iw &>/dev/null; then
+        while read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*Interface[[:space:]]([^ ]+) ]]; then
+                iface="${BASH_REMATCH[1]}"
+                if [[ ! " ${interfaces[@]} " =~ " ${iface} " ]]; then
+                    interfaces+=("$iface")
+                fi
+            fi
+        done < <(iw dev 2>/dev/null)
     fi
+    
+    # Method 3: Check for wlan interfaces
+    for iface in /sys/class/net/wlan*; do
+        if [ -e "$iface" ]; then
+            iface=$(basename "$iface")
+            if [[ ! " ${interfaces[@]} " =~ " ${iface} " ]]; then
+                interfaces+=("$iface")
+            fi
+        fi
+    done
+    
+    # Display found wireless interfaces
+    if [ ${#interfaces[@]} -gt 0 ]; then
+        echo -e "${GREEN}Available wireless interfaces:${NC}"
+        for iface in "${interfaces[@]}"; do
+            echo -e "${BLUE}$i. $iface${NC}"
+            ((i++))
+        done
+        # Store interfaces for later selection
+        printf "%s\n" "${interfaces[@]}" > "$TEMP_DIR/interfaces.txt"
+    else
+        echo -e "${YELLOW}No wireless interfaces detected.${NC}"
+        
+        # Fall back to showing all interfaces
+        echo -e "${YELLOW}Showing all network interfaces:${NC}"
+        i=1
+        while read -r line; do
+            if [[ "$line" =~ ^[0-9]+:[[:space:]]([^:]+): ]]; then
+                iface="${BASH_REMATCH[1]}"
+                # Skip loopback and virtual interfaces
+                if [[ "$iface" != "lo" && "$iface" != veth* && "$iface" != docker* && "$iface" != br* ]]; then
+                    echo -e "${BLUE}$i. $iface${NC}"
+                    interfaces+=("$iface")
+                    ((i++))
+                fi
+            fi
+        done < <(ip link show)
+        
+        # Store interfaces for later selection
+        printf "%s\n" "${interfaces[@]}" > "$TEMP_DIR/interfaces.txt"
+        
+        if [ ${#interfaces[@]} -eq 0 ]; then
+            echo -e "${RED}No usable network interfaces found.${NC}"
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 # Function to select network interface
@@ -95,9 +160,35 @@ select_interface() {
     if [ -n "$interface" ]; then
         echo -e "${BLUE}Using specified interface: $interface${NC}"
     else
-        show_interfaces
-        echo -e "${GREEN}Enter the interface name to use:${NC}"
-        read interface
+        if ! show_interfaces; then
+            echo -e "${RED}Failed to detect network interfaces.${NC}"
+            return 1
+        fi
+        
+        echo -e "${GREEN}Enter the number of the interface to use (or 'q' to quit):${NC}"
+        read choice
+        
+        # Check if user wants to quit
+        if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+            echo -e "${BLUE}Exiting...${NC}"
+            exit 0
+        fi
+        
+        # Validate numeric input
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}Invalid selection. Please enter a number.${NC}"
+            return 1
+        fi
+        
+        # Get interface from selection
+        interface=$(sed -n "${choice}p" "$TEMP_DIR/interfaces.txt")
+        
+        if [ -z "$interface" ]; then
+            echo -e "${RED}Invalid selection.${NC}"
+            return 1
+        fi
+        
+        echo -e "${BLUE}Selected interface: $interface${NC}"
     fi
     
     # Check if interface exists
@@ -114,8 +205,21 @@ select_interface() {
     # Get the monitor interface name (usually interface + mon)
     MONITOR_INTERFACE="${interface}mon"
     if ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
-        # Some drivers use the same interface name in monitor mode
-        MONITOR_INTERFACE="$interface"
+        # Try other common monitor interface naming patterns
+        if ip link show "mon0" &>/dev/null; then
+            MONITOR_INTERFACE="mon0"
+        elif ip link show "${interface}mon0" &>/dev/null; then
+            MONITOR_INTERFACE="${interface}mon0"
+        else
+            # Some drivers use the same interface name in monitor mode
+            MONITOR_INTERFACE="$interface"
+        fi
+    fi
+    
+    # Verify the monitor interface exists
+    if ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
+        echo -e "${RED}Failed to create monitor interface. Please check your wireless card supports monitor mode.${NC}"
+        return 1
     fi
     
     echo -e "${GREEN}Monitor interface: $MONITOR_INTERFACE${NC}"
@@ -319,6 +423,9 @@ main() {
     echo -e "${GREEN}   Network Deauthentication Script      ${NC}"
     echo -e "${GREEN}========================================${NC}"
     
+    # Create temp directory first to store interface info
+    mkdir -p "$TEMP_DIR"
+    
     check_requirements
     parse_args "$@"
     
@@ -347,7 +454,7 @@ main() {
         fi
         
         echo -e "${GREEN}Would you like to try again? (y/n)${NC}"
-        read try_again
+        read -p "> " try_again
         if [[ ! "$try_again" =~ ^[Yy] ]]; then
             echo -e "${BLUE}Exiting...${NC}"
             exit 0
