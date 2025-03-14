@@ -252,13 +252,22 @@ scan_networks() {
         # Process the CSV file to get networks
         # Skip header line and empty lines, then display networks with their details
         grep -a -v "^$" "${SCAN_FILE}-01.csv" | tail -n +2 | \
-            awk -F, '{gsub(/ /, "", $1); gsub(/ /, "", $4); gsub(/^ | $/, "", $14); 
-                      printf "%-3s %-18s %-4s %-4s %s\n", NR".", $1, "Ch:"$4, "Pwr:"$6, $14}' > "$TEMP_DIR/available_networks.txt"
+            awk -F, '{gsub(/ /, "", $1); gsub(/ /, "", $4); gsub(/^ | $/, "", $6); gsub(/^ | $/, "", $14); 
+                      printf "%s;%s;%s;%s;%s\n", NR, $1, $4, $6, $14}' > "$TEMP_DIR/available_networks.txt"
         
-        # Display networks with color
-        cat "$TEMP_DIR/available_networks.txt" | while read line; do
-            echo -e "${BLUE}$line${NC}"
-        done
+        # Display table header
+        printf "${BLUE}%-4s %-18s %-8s %-8s %-12s %s${NC}\n" "No." "BSSID" "Channel" "Power" "Encryption" "ESSID"
+        printf "${BLUE}%-4s %-18s %-8s %-8s %-12s %s${NC}\n" "---" "-------------------" "-------" "-------" "-----------" "-----"
+        
+        # Display networks in table format with color
+        while IFS=";" read -r num bssid channel power essid; do
+            # Get encryption type from the original CSV
+            encryption=$(grep "$bssid" "${SCAN_FILE}-01.csv" | awk -F, '{print $6}' | sed 's/^ *//' | sed 's/ *$//')
+            if [ -z "$encryption" ]; then
+                encryption="Open"
+            fi
+            printf "${BLUE}%-4s %-18s %-8s %-8s %-12s %s${NC}\n" "$num." "$bssid" "Ch:$channel" "$power" "$encryption" "$essid"
+        done < "$TEMP_DIR/available_networks.txt"
     else
         echo -e "${RED}No networks found or scan interrupted.${NC}"
         return 1
@@ -281,9 +290,7 @@ select_target() {
     fi
     
     # Extract BSSID, channel and ESSID
-    TARGET_BSSID=$(echo "$selected" | awk '{print $2}')
-    TARGET_CHANNEL=$(echo "$selected" | awk '{print $4}' | cut -d':' -f2)
-    TARGET_ESSID=$(echo "$selected" | awk '{$1=$2=$3=$4=""; print $0}' | sed 's/^ *//')
+    IFS=";" read -r _ TARGET_BSSID TARGET_CHANNEL _ TARGET_ESSID <<< "$selected"
     
     echo -e "${GREEN}Selected target network: ${BLUE}$TARGET_ESSID${NC} (BSSID: ${BLUE}$TARGET_BSSID${NC}, Channel: ${BLUE}$TARGET_CHANNEL${NC})"
     
@@ -306,8 +313,8 @@ select_target() {
     if [ -f "${CLIENT_SCAN_FILE}-01.csv" ]; then
         # Skip to the "Station MAC" section and display clients
         awk -F, '/Station MAC/{flag=1;next} flag' "${CLIENT_SCAN_FILE}-01.csv" | \
-            grep -v "^$" | awk -F, '{gsub(/ /, "", $1); 
-                      printf "%-3s %-18s %-10s\n", NR".", $1, "Power:"$4}' > "$TEMP_DIR/available_clients.txt"
+            grep -v "^$" | awk -F, '{gsub(/ /, "", $1); gsub(/ /, "", $4); 
+                      printf "%s;%s;%s;%s\n", NR, $1, $4, $7}' > "$TEMP_DIR/available_clients.txt"
         
         # Check if we found any clients
         if [ ! -s "$TEMP_DIR/available_clients.txt" ]; then
@@ -327,9 +334,16 @@ select_target() {
         fi
         
         echo -e "${GREEN}Found clients:${NC}"
-        cat "$TEMP_DIR/available_clients.txt" | while read line; do
-            echo -e "${BLUE}$line${NC}"
-        done
+        
+        # Display table header for clients
+        printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "No." "MAC Address" "Power" "Packets"
+        printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "---" "-------------------" "----------" "------------"
+        
+        # Display clients in table format
+        while IFS=";" read -r num mac power packets; do
+            printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "$num." "$mac" "$power" "$packets"
+        done < "$TEMP_DIR/available_clients.txt"
+        
         return 0
     else
         echo -e "${RED}No client scan data available.${NC}"
@@ -355,11 +369,16 @@ perform_deauth() {
     echo -e "${GREEN}Select client to deauthenticate:${NC}"
     echo "0. All clients (broadcast deauth)"
     
-    # Show clients if available
+    # Show clients table if available
     if [ -s "$TEMP_DIR/available_clients.txt" ]; then
-        cat "$TEMP_DIR/available_clients.txt" | while read line; do
-            echo -e "${BLUE}$line${NC}"
-        done
+        # Display table header for clients
+        printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "No." "MAC Address" "Power" "Packets"
+        printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "---" "-------------------" "----------" "------------"
+        
+        # Display clients in table format
+        while IFS=";" read -r num mac power packets; do
+            printf "${BLUE}%-4s %-18s %-10s %-12s${NC}\n" "$num." "$mac" "$power" "$packets"
+        done < "$TEMP_DIR/available_clients.txt"
     fi
     
     read client_choice
