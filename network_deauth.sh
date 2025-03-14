@@ -23,6 +23,24 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Helper function to print formatted tables
+print_table_header() {
+    local format="$1"
+    local header="$2"
+    local separator="$3"
+    
+    printf "\n${GREEN}${format}${NC}\n" ${header}
+    printf "${GREEN}${format}${NC}\n" ${separator}
+}
+
+# Print a table row with specified color
+print_table_row() {
+    local color="$1"
+    local format="$2"
+    shift 2
+    printf "${color}${format}${NC}\n" "$@"
+}
+
 # Check for required tools
 check_requirements() {
     local tools=("airmon-ng" "airodump-ng" "aireplay-ng")
@@ -85,36 +103,33 @@ show_interfaces() {
     
     echo -e "${BLUE}Detecting network interfaces...${NC}"
     
-    # Try multiple methods to identify wireless interfaces
-    
-    # Method 1: Check for interfaces in /sys/class/net with wireless subdirectory
-    for iface in /sys/class/net/*; do
-        if [ -d "$iface/wireless" ] || [ -d "$iface/phy80211" ]; then
-            interfaces+=("$(basename "$iface")")
-        fi
-    done
-    
-    # Method 2: Use iw command if available
+    # Method 1: Use iw command if available
     if command -v iw &>/dev/null; then
         while read -r line; do
             if [[ "$line" =~ ^[[:space:]]*Interface[[:space:]]([^ ]+) ]]; then
                 iface="${BASH_REMATCH[1]}"
-                if [[ ! " ${interfaces[@]} " =~ " ${iface} " ]]; then
-                    interfaces+=("$iface")
-                fi
+                interfaces+=("$iface")
             fi
         done < <(iw dev 2>/dev/null)
     fi
     
-    # Method 3: Check for wlan interfaces
-    for iface in /sys/class/net/wlan*; do
-        if [ -e "$iface" ]; then
-            iface=$(basename "$iface")
-            if [[ ! " ${interfaces[@]} " =~ " ${iface} " ]]; then
-                interfaces+=("$iface")
+    # Method 2: Check for interfaces with wireless capabilities
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        for iface in /sys/class/net/*; do
+            if [ -d "$iface/wireless" ] || [ -d "$iface/phy80211" ]; then
+                interfaces+=("$(basename "$iface")")
             fi
-        fi
-    done
+        done
+    fi
+    
+    # Method 3: Check for wlan interfaces
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        for iface in /sys/class/net/wlan*; do
+            if [ -e "$iface" ]; then
+                interfaces+=("$(basename "$iface")")
+            fi
+        done
+    fi
     
     # Display found wireless interfaces
     if [ ${#interfaces[@]} -gt 0 ]; then
@@ -202,22 +217,16 @@ select_interface() {
     airmon-ng check kill >/dev/null
     airmon-ng start "$interface" >/dev/null
     
-    # Get the monitor interface name (usually interface + mon)
-    MONITOR_INTERFACE="${interface}mon"
-    if ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
-        # Try other common monitor interface naming patterns
-        if ip link show "mon0" &>/dev/null; then
-            MONITOR_INTERFACE="mon0"
-        elif ip link show "${interface}mon0" &>/dev/null; then
-            MONITOR_INTERFACE="${interface}mon0"
-        else
-            # Some drivers use the same interface name in monitor mode
-            MONITOR_INTERFACE="$interface"
+    # Find the monitor interface name
+    for possible_name in "${interface}mon" "mon0" "${interface}mon0" "$interface"; do
+        if ip link show "$possible_name" &>/dev/null; then
+            MONITOR_INTERFACE="$possible_name"
+            break
         fi
-    fi
+    done
     
     # Verify the monitor interface exists
-    if ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
+    if [ -z "$MONITOR_INTERFACE" ] || ! ip link show "$MONITOR_INTERFACE" &>/dev/null; then
         echo -e "${RED}Failed to create monitor interface. Please check your wireless card supports monitor mode.${NC}"
         return 1
     fi
@@ -238,24 +247,17 @@ scan_networks() {
     airodump-ng -w "$SCAN_FILE" --output-format csv "$MONITOR_INTERFACE" >/dev/null 2>&1 &
     airodump_pid=$!
     
-    # Set up a monitoring process to count networks in real-time
+    # Monitor networks count in real-time
     (
-        # Previous count to determine when to update
         prev_count=0
-        
-        # Monitor until the scan process is killed
         while kill -0 $airodump_pid 2>/dev/null; do
             if [ -f "${SCAN_FILE}-01.csv" ]; then
-                # Count networks by excluding headers and empty lines
                 current_count=$(grep -v "^$" "${SCAN_FILE}-01.csv" | grep -v "^BSSID" | grep -v "^Station MAC" | wc -l)
-                
-                # Only update if count has changed
                 if [ "$current_count" -ne "$prev_count" ]; then
                     echo -ne "\r${GREEN}Networks found: $current_count ${NC}  "
                     prev_count=$current_count
                 fi
             fi
-            # Check every 0.5 seconds
             sleep 0.5
         done
     ) &
@@ -264,10 +266,8 @@ scan_networks() {
     # Wait for user to press Enter
     read
     
-    # Kill the monitor process
+    # Kill the processes
     kill $monitor_pid 2>/dev/null
-    
-    # Kill airodump-ng
     kill $airodump_pid 2>/dev/null
     wait $airodump_pid 2>/dev/null
     
@@ -276,44 +276,48 @@ scan_networks() {
     
     # Parse and display networks from CSV file
     if [ -f "${SCAN_FILE}-01.csv" ]; then
-        # Clean temp file for networks
         > "$TEMP_DIR/available_networks.txt"
         
-        # Process the CSV file to get networks - with careful text extraction
-        counter=1
-        total_networks=0
+        # Process the CSV to extract networks
+        awk -F, '
+        BEGIN { count = 0; }
+        {
+            gsub(/^ *| *$/, "", $0);
+            if (NF > 13 && !match($0, /^BSSID|^Station/) && length($1) > 10) {
+                count++;
+                bssid = $1;
+                gsub(/^ *| *$/, "", bssid);
+                
+                channel = $4;
+                gsub(/^ *| *$/, "", channel);
+                
+                power = $6;
+                gsub(/^ *| *$/, "", power);
+                
+                encryption = $6;
+                gsub(/^ *| *$/, "", encryption);
+                
+                essid = $14;
+                for (i=15; i<=NF; i++) essid = essid "," $i;
+                gsub(/^ *| *$/, "", essid);
+                
+                print count ";" bssid ";" channel ";" power ";" encryption ";" essid;
+            }
+        }
+        END { print "TOTAL=" count; }
+        ' "${SCAN_FILE}-01.csv" > "$TEMP_DIR/available_networks.txt"
         
-        while IFS= read -r line; do
-            # Skip empty lines and header
-            if [[ -z "$line" || "$line" =~ ^BSSID || "$line" =~ ^Station ]]; then
-                continue
-            fi
-            
-            # Extract and clean fields from CSV
-            bssid=$(echo "$line" | awk -F, '{print $1}' | sed 's/^ *//;s/ *$//')
-            channel=$(echo "$line" | awk -F, '{print $4}' | sed 's/^ *//;s/ *$//')
-            power=$(echo "$line" | awk -F, '{print $6}' | sed 's/^ *//;s/ *$//')
-            encryption=$(echo "$line" | awk -F, '{print $6}' | sed 's/^ *//;s/ *$//')
-            essid=$(echo "$line" | awk -F, '{print $14}' | sed 's/^ *//;s/ *$//')
-            
-            # Only process if it's an actual network (has BSSID and isn't a station)
-            if [[ -n "$bssid" && ! "$bssid" =~ ^Station ]]; then
-                # Store in our file with semicolons as separators
-                echo "${counter};${bssid};${channel};${power};${encryption};${essid}" >> "$TEMP_DIR/available_networks.txt"
-                ((counter++))
-                ((total_networks++))
-            fi
-        done < "${SCAN_FILE}-01.csv"
+        # Get the total count from the last line
+        total_networks=$(grep "TOTAL=" "$TEMP_DIR/available_networks.txt" | cut -d'=' -f2)
+        sed -i '/TOTAL=/d' "$TEMP_DIR/available_networks.txt"
         
         echo -e "${GREEN}Scan complete. Found $total_networks networks.${NC}"
         
-        # Display table header
-        printf "\n${GREEN}%-4s %-18s %-8s %-8s %-10s %s${NC}\n" "No." "BSSID" "Channel" "Power" "Encryption" "ESSID"
-        printf "${GREEN}%-4s %-18s %-8s %-8s %-10s %s${NC}\n" "===" "==================" "========" "========" "==========" "====="
+        # Display table of networks
+        print_table_header "%-4s %-18s %-8s %-8s %-10s %s" "No. BSSID Channel Power Encryption ESSID" "=== ================== ======== ======== ========== ====="
         
-        # Display networks in table format
         while IFS=";" read -r num bssid channel power encryption essid; do
-            # Get better encryption info
+            # Better encryption info
             if [[ "$encryption" == *"WPA2"* ]]; then
                 encryption="WPA2"
             elif [[ "$encryption" == *"WPA"* ]]; then
@@ -324,10 +328,10 @@ scan_networks() {
                 encryption="Open"
             fi
             
-            # Format better power value
+            # Format power value
             power="${power}dBm"
             
-            printf "${BLUE}%-4s %-18s %-8s %-8s %-10s %s${NC}\n" \
+            print_table_row "$BLUE" "%-4s %-18s %-8s %-8s %-10s %s" \
                 "${num}." "${bssid}" "Ch:${channel}" "${power}" "${encryption}" "${essid}"
         done < "$TEMP_DIR/available_networks.txt"
         
@@ -358,11 +362,10 @@ select_target() {
     
     echo -e "${GREEN}Selected target network: ${BLUE}$TARGET_ESSID${NC} (BSSID: ${BLUE}$TARGET_BSSID${NC}, Channel: ${BLUE}$TARGET_CHANNEL${NC})"
     
-    # Get clients of the selected network
+    # Start client scan
     echo -e "${BLUE}Scanning for clients on $TARGET_ESSID...${NC}"
     echo -e "${YELLOW}Press Enter to stop scanning for clients...${NC}"
     
-    # Start targeted scan
     CLIENT_SCAN_FILE="$TEMP_DIR/client_scan"
     airodump-ng -c "$TARGET_CHANNEL" --bssid "$TARGET_BSSID" -w "$CLIENT_SCAN_FILE" --output-format csv "$MONITOR_INTERFACE" >/dev/null 2>&1 &
     client_scan_pid=$!
@@ -373,35 +376,33 @@ select_target() {
     kill $client_scan_pid 2>/dev/null
     wait $client_scan_pid 2>/dev/null
     
-    # Parse and display clients
+    # Parse client information from CSV
     if [ -f "${CLIENT_SCAN_FILE}-01.csv" ]; then
         > "$TEMP_DIR/available_clients.txt"
         
-        # Process client information carefully
-        counter=1
-        station_section=false
-        
-        while IFS= read -r line; do
-            # Start processing after "Station MAC" line
-            if [[ "$line" =~ "Station MAC" ]]; then
-                station_section=true
-                continue
-            fi
-            
-            # Only process if we're in the station section
-            if [[ "$station_section" == true && -n "$line" && ! "$line" =~ ^$ ]]; then
-                # Extract client MAC, power and packets
-                mac=$(echo "$line" | awk -F, '{print $1}' | sed 's/^ *//;s/ *$//')
-                power=$(echo "$line" | awk -F, '{print $4}' | sed 's/^ *//;s/ *$//')
-                packets=$(echo "$line" | awk -F, '{print $5}' | sed 's/^ *//;s/ *$//')
+        # Extract clients with awk for better efficiency
+        awk -F, '
+        BEGIN { station_section = 0; count = 0; }
+        {
+            if (match($0, /Station MAC/)) {
+                station_section = 1;
+                next;
+            }
+            if (station_section == 1 && length($1) > 10) {
+                count++;
+                mac = $1;
+                gsub(/^ *| *$/, "", mac);
                 
-                # Only add if we have a valid MAC
-                if [[ -n "$mac" && ${#mac} -ge 17 ]]; then
-                    echo "${counter};${mac};${power};${packets}" >> "$TEMP_DIR/available_clients.txt"
-                    ((counter++))
-                fi
-            fi
-        done < "${CLIENT_SCAN_FILE}-01.csv"
+                power = $4;
+                gsub(/^ *| *$/, "", power);
+                
+                packets = $5;
+                gsub(/^ *| *$/, "", packets);
+                
+                print count ";" mac ";" power ";" packets;
+            }
+        }
+        ' "${CLIENT_SCAN_FILE}-01.csv" > "$TEMP_DIR/available_clients.txt"
         
         # Check if we found any clients
         if [ ! -s "$TEMP_DIR/available_clients.txt" ]; then
@@ -422,16 +423,12 @@ select_target() {
         
         echo -e "${GREEN}Found clients:${NC}"
         
-        # Display table header for clients
-        printf "\n${GREEN}%-4s %-18s %-10s %-10s${NC}\n" "No." "MAC Address" "Power" "Packets"
-        printf "${GREEN}%-4s %-18s %-10s %-10s${NC}\n" "===" "==================" "==========" "=========="
+        # Display clients table
+        print_table_header "%-4s %-18s %-10s %-10s" "No. MAC Address Power Packets" "=== ================== ========== =========="
         
-        # Display clients in table format
         while IFS=";" read -r num mac power packets; do
-            # Format power
             power="${power} dBm"
-            
-            printf "${BLUE}%-4s %-18s %-10s %-10s${NC}\n" "${num}." "${mac}" "${power}" "${packets}"
+            print_table_row "$BLUE" "%-4s %-18s %-10s %-10s" "${num}." "${mac}" "${power}" "${packets}"
         done < "$TEMP_DIR/available_clients.txt"
         
         echo ""
@@ -462,14 +459,11 @@ perform_deauth() {
     
     # Show clients table if available
     if [ -s "$TEMP_DIR/available_clients.txt" ]; then
-        # Display table header for clients
-        printf "\n${GREEN}%-4s %-18s %-10s %-10s${NC}\n" "No." "MAC Address" "Power" "Packets"
-        printf "${GREEN}%-4s %-18s %-10s %-10s${NC}\n" "===" "==================" "==========" "=========="
+        print_table_header "%-4s %-18s %-10s %-10s" "No. MAC Address Power Packets" "=== ================== ========== =========="
         
-        # Display clients in table format
         while IFS=";" read -r num mac power packets; do
             power="${power} dBm"
-            printf "${BLUE}%-4s %-18s %-10s %-10s${NC}\n" "${num}." "${mac}" "${power}" "${packets}"
+            print_table_row "$BLUE" "%-4s %-18s %-10s %-10s" "${num}." "${mac}" "${power}" "${packets}"
         done < "$TEMP_DIR/available_clients.txt"
         
         echo ""
