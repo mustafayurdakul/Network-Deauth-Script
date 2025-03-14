@@ -1,0 +1,18 @@
+#!/bin/bash
+# Simple launcher for the Python network deauth script
+
+# Get the directory where this script is located
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Check if python3 is available
+if command -v python3 &> /dev/null; then
+    PYTHON="python3"
+elif command -v python &> /dev/null; then
+    PYTHON="python"
+else
+    echo "Error: Python is required but not installed."
+    exit 1
+fi
+
+# Execute the Python script
+sudo $PYTHON "$DIR/network_deauth.py" "$@"
