@@ -238,22 +238,51 @@ scan_networks() {
     airodump-ng -w "$SCAN_FILE" --output-format csv "$MONITOR_INTERFACE" >/dev/null 2>&1 &
     airodump_pid=$!
     
+    # Set up a monitoring process to count networks in real-time
+    (
+        # Previous count to determine when to update
+        prev_count=0
+        
+        # Monitor until the scan process is killed
+        while kill -0 $airodump_pid 2>/dev/null; do
+            if [ -f "${SCAN_FILE}-01.csv" ]; then
+                # Count networks by excluding headers and empty lines
+                current_count=$(grep -v "^$" "${SCAN_FILE}-01.csv" | grep -v "^BSSID" | grep -v "^Station MAC" | wc -l)
+                
+                # Only update if count has changed
+                if [ "$current_count" -ne "$prev_count" ]; then
+                    echo -ne "\r${GREEN}Networks found: $current_count ${NC}  "
+                    prev_count=$current_count
+                fi
+            fi
+            # Check every 0.5 seconds
+            sleep 0.5
+        done
+    ) &
+    monitor_pid=$!
+    
     # Wait for user to press Enter
     read
+    
+    # Kill the monitor process
+    kill $monitor_pid 2>/dev/null
     
     # Kill airodump-ng
     kill $airodump_pid 2>/dev/null
     wait $airodump_pid 2>/dev/null
     
+    # Clear the line and print newline
+    echo -e "\r\033[K"
+    
     # Parse and display networks from CSV file
     if [ -f "${SCAN_FILE}-01.csv" ]; then
-        echo -e "${GREEN}Available networks:${NC}"
-        
         # Clean temp file for networks
         > "$TEMP_DIR/available_networks.txt"
         
         # Process the CSV file to get networks - with careful text extraction
         counter=1
+        total_networks=0
+        
         while IFS= read -r line; do
             # Skip empty lines and header
             if [[ -z "$line" || "$line" =~ ^BSSID || "$line" =~ ^Station ]]; then
@@ -272,8 +301,11 @@ scan_networks() {
                 # Store in our file with semicolons as separators
                 echo "${counter};${bssid};${channel};${power};${encryption};${essid}" >> "$TEMP_DIR/available_networks.txt"
                 ((counter++))
+                ((total_networks++))
             fi
         done < "${SCAN_FILE}-01.csv"
+        
+        echo -e "${GREEN}Scan complete. Found $total_networks networks.${NC}"
         
         # Display table header
         printf "\n${GREEN}%-4s %-18s %-8s %-8s %-10s %s${NC}\n" "No." "BSSID" "Channel" "Power" "Encryption" "ESSID"
